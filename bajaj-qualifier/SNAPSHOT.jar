@@ -1,0 +1,175 @@
+# Creating a standalone Java program, compiling it, and packaging into a runnable JAR.
+# The program uses only the JDK (java.net.http) so no external dependencies are required.
+# It accepts optional command-line args: name, regNo, email. If not provided, it uses defaults.
+# The user's roll number from memory (22BCE0476) will be used as regNo by default.
+# After building, this cell will output the files created and provide a download link to the JAR.
+
+import os, textwrap, subprocess, shutil, sys, json, stat, pathlib, io
+
+# Prepare workspace
+workspace = "/mnt/data/springless_webhook_jar"
+os.makedirs(workspace, exist_ok=True)
+
+main_java = r'''
+import java.net.URI;
+import java.net.http.*;
+import java.time.Duration;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class Main {
+    // Final SQL query to send
+    private static final String FINAL_QUERY = "SELECT \\n" +
+            "    e.EMP_ID,\\n" +
+            "    e.FIRST_NAME,\\n" +
+            "    e.LAST_NAME,\\n" +
+            "    d.DEPARTMENT_NAME,\\n" +
+            "    (\\n" +
+            "        SELECT COUNT(*) \\n" +
+            "        FROM EMPLOYEE e2 \\n" +
+            "        WHERE e2.DEPARTMENT = e.DEPARTMENT\\n" +
+            "          AND e2.DOB > e.DOB\\n" +
+            "    ) AS YOUNGER_EMPLOYEES_COUNT\\n" +
+            "FROM EMPLOYEE e\\n" +
+            "JOIN DEPARTMENT d ON e.DEPARTMENT = d.DEPARTMENT_ID\\n" +
+            "ORDER BY e.EMP_ID DESC;";
+    public static void main(String[] args) throws Exception {
+        String name = args.length > 0 ? args[0] : \"John Doe\";
+        String regNo = args.length > 1 ? args[1] : \"22BCE0476\"; // default from your memory
+        String email = args.length > 2 ? args[2] : \"john@example.com\";
+
+        String genUrl = \"https://bfhldevapigw.healthrx.co.in/hiring/generateWebhook/JAVA\";
+
+        String jsonBody = String.format(\"{\\\"name\\\":\\\"%s\\\",\\\"regNo\\\":\\\"%s\\\",\\\"email\\\":\\\"%s\\\"}\", 
+                                        escapeJson(name), escapeJson(regNo), escapeJson(email));
+
+        HttpClient client = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(20))
+                .build();
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(genUrl))
+                .timeout(Duration.ofSeconds(20))
+                .header(\"Content-Type\", \"application/json\")
+                .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
+                .build();
+
+        System.out.println(\"Sending generateWebhook POST to: \" + genUrl);
+        System.out.println(\"Request body: \" + jsonBody);
+        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+        System.out.println(\"Response code: \" + response.statusCode());
+        System.out.println(\"Response body: \" + response.body());
+
+        if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            System.err.println(\"Non-success response from generateWebhook. Exiting.\");
+            return;
+        }
+
+        // Very small JSON parsing without external libs. Extract \"webhook\" and \"accessToken\" fields.
+        String webhook = extractJsonField(response.body(), \"webhook\");
+        String accessToken = extractJsonField(response.body(), \"accessToken\");
+
+        if (webhook == null || accessToken == null) {
+            System.err.println(\"Could not find 'webhook' or 'accessToken' in response. Exiting.\");
+            return;
+        }
+
+        System.out.println(\"Parsed webhook: \" + webhook);
+        System.out.println(\"Parsed accessToken: \" + (accessToken.length() > 10 ? accessToken.substring(0,10)+\"...\" : accessToken));
+
+        // Prepare final submit
+        String submitUrl = webhook; // as returned
+        String submitBody = String.format(\"{\\\"finalQuery\\\":\\\"%s\\\"}\", escapeJson(FINAL_QUERY));
+
+        HttpRequest submitReq = HttpRequest.newBuilder()
+                .uri(URI.create(submitUrl))
+                .timeout(Duration.ofSeconds(20))
+                .header(\"Content-Type\", \"application/json\")
+                .header(\"Authorization\", accessToken)
+                .POST(HttpRequest.BodyPublishers.ofString(submitBody))
+                .build();
+
+        System.out.println(\"Sending finalQuery to webhook: \" + submitUrl);
+        System.out.println(\"finalQuery body (truncated): \" + (submitBody.length()>200 ? submitBody.substring(0,200)+\"...\" : submitBody));
+
+        HttpResponse<String> submitResp = client.send(submitReq, HttpResponse.BodyHandlers.ofString());
+        System.out.println(\"Submit response code: \" + submitResp.statusCode());
+        System.out.println(\"Submit response body: \" + submitResp.body());
+    }
+
+    private static String extractJsonField(String json, String field) {
+        // Simple regex to capture "field": "value" (handles basic cases)
+        Pattern p = Pattern.compile(\"\\\"\" + Pattern.quote(field) + \"\\\"\\s*:\\s*\\\"(.*?)\\\"\");
+        Matcher m = p.matcher(json);
+        if (m.find()) return m.group(1);
+        return null;
+    }
+
+    private static String escapeJson(String s) {
+        return s.replace(\"\\\\\",\"\\\\\\\\\").replace(\"\\\"\",\"\\\\\\\"\").replace(\"\\n\",\"\\\\n\").replace(\"\\r\",\"\\\\r\").replace(\"\\t\",\"\\\\t\");
+    }
+}
+'''
+
+# Write Java source
+main_path = os.path.join(workspace, "Main.java")
+with open(main_path, "w") as f:
+    f.write(main_java)
+
+# Compile Java
+javac_path = shutil.which("javac")
+jar_path = shutil.which("jar")
+java_path = shutil.which("java")
+
+compile_success = False
+compile_output = ""
+if javac_path:
+    try:
+        proc = subprocess.run([javac_path, main_path], capture_output=True, text=True, cwd=workspace, timeout=120)
+        compile_output = proc.stdout + proc.stderr
+        compile_success = (proc.returncode == 0)
+    except Exception as e:
+        compile_output = str(e)
+else:
+    compile_output = "javac not found in the environment."
+
+# Package into JAR if compiled
+jar_file = os.path.join(workspace, "webhook-client.jar")
+if compile_success and jar_path:
+    # create manifest
+    manifest = "Main-Class: Main\n"
+    with open(os.path.join(workspace, "manifest.txt"), "w") as mf:
+        mf.write(manifest)
+    try:
+        proc = subprocess.run([jar_path, "cfm", jar_file, "manifest.txt", "Main.class"], capture_output=True, text=True, cwd=workspace, timeout=60)
+        jar_output = proc.stdout + proc.stderr
+        jar_created = (proc.returncode == 0 and os.path.exists(jar_file))
+    except Exception as e:
+        jar_output = str(e)
+        jar_created = False
+else:
+    jar_created = False
+    jar_output = "jar tool not found or compilation failed."
+
+# Prepare result info and list files
+files_created = os.listdir(workspace)
+
+result = {
+    "workspace": workspace,
+    "files": files_created,
+    "compile_success": compile_success,
+    "compile_output": compile_output,
+    "jar_created": jar_created,
+    "jar_file": jar_file if jar_created else None,
+    "jar_output": jar_output,
+    "javac_present": javac_path is not None,
+    "jar_present": jar_path is not None,
+    "java_present": java_path is not None
+}
+
+# Save result summary to file for user
+with open(os.path.join(workspace, "build_summary.json"), "w") as s:
+    s.write(json.dumps(result, indent=2))
+
+result
+
